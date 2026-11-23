@@ -4,18 +4,18 @@ import sys
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # H4GoldLiquidityPro
-# XAUUSD H4 liquidity sweep + M15 confirmation
+# H4 liquidity sweep + M15 confirmation
 # Analysis alerts only. No automatic trade execution.
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TZ = ZoneInfo("Africa/Kampala")
-YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X"
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,18 +23,25 @@ logging.basicConfig(
 )
 
 
-def get_candles(interval, period):
+def get_candles(symbol, interval, period):
+    url = YAHOO_URL + symbol
+
     response = requests.get(
-        YAHOO_URL,
+        url,
         params={"interval": interval, "range": period},
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=25
     )
     response.raise_for_status()
 
-    result = response.json()["chart"]["result"]
+    data = response.json()["chart"]
+
+    if data.get("error"):
+        raise ValueError(str(data["error"]))
+
+    result = data.get("result")
     if not result:
-        raise ValueError("No XAUUSD market data available")
+        raise ValueError(f"No market data for {symbol}")
 
     item = result[0]
     quote = item["indicators"]["quote"][0]
@@ -49,7 +56,51 @@ def get_candles(interval, period):
         "close": quote["close"]
     })
 
-    return df.dropna().set_index("time").sort_index()
+    df = df.dropna().set_index("time").sort_index()
+
+    if df.empty:
+        raise ValueError(f"Empty candle data for {symbol}")
+
+    return df
+
+
+def get_market_data():
+    sources = [
+        (
+            "XAUUSD=X",
+            "Yahoo Finance XAUUSD=X (gold spot reference)"
+        ),
+        (
+            "GC=F",
+            "Yahoo Finance GC=F (COMEX gold futures)"
+        )
+    ]
+
+    errors = []
+
+    for symbol, source in sources:
+        try:
+            logging.info("Trying market data source: %s", symbol)
+
+            # Both timeframes must come from the same symbol.
+            m15 = get_candles(symbol, "15m", "5d")
+            h1 = get_candles(symbol, "60m", "60d")
+
+            logging.info("Market data source accepted: %s", symbol)
+
+            return m15, h1, source
+
+        except Exception as error:
+            logging.warning(
+                "Market source %s failed: %s",
+                symbol,
+                error
+            )
+            errors.append(f"{symbol}: {error}")
+
+    raise RuntimeError(
+        "All market data sources failed. " + " | ".join(errors)
+    )
 
 
 def send_telegram(message):
@@ -66,9 +117,11 @@ def send_telegram(message):
         },
         timeout=25
     )
+
     response.raise_for_status()
 
     data = response.json()
+
     if not data.get("ok"):
         raise RuntimeError("Telegram rejected the message")
 
@@ -76,10 +129,9 @@ def send_telegram(message):
 def analyse_gold():
     now = pd.Timestamp.now(tz="UTC")
 
-    m15 = get_candles("15m", "5d")
-    h1 = get_candles("60m", "60d")
+    m15, h1, source = get_market_data()
 
-    # Build four-hour candles from hourly data.
+    # Build H4 candles from hourly data.
     h4 = h1.resample("4h").agg({
         "open": "first",
         "high": "max",
@@ -88,8 +140,13 @@ def analyse_gold():
     }).dropna()
 
     # Keep only fully completed candles.
-    h4 = h4[h4.index + pd.Timedelta(hours=4) <= now]
-    m15 = m15[m15.index + pd.Timedelta(minutes=15) <= now]
+    h4 = h4[
+        h4.index + pd.Timedelta(hours=4) <= now
+    ]
+
+    m15 = m15[
+        m15.index + pd.Timedelta(minutes=15) <= now
+    ]
 
     if len(h4) < 3 or len(m15) < 6:
         raise ValueError("Insufficient completed candles")
@@ -106,7 +163,9 @@ def analyse_gold():
         and sweep["close"] > previous["low"]
     ):
         direction = "LONG"
-        reason = "H4 swept previous lows and closed back above them."
+        reason = (
+            "H4 swept previous lows and closed back above them."
+        )
 
     # Bearish H4 liquidity sweep.
     elif (
@@ -114,7 +173,9 @@ def analyse_gold():
         and sweep["close"] < previous["high"]
     ):
         direction = "SHORT"
-        reason = "H4 swept previous highs and closed back below them."
+        reason = (
+            "H4 swept previous highs and closed back below them."
+        )
 
     if direction is None:
         return None
@@ -128,6 +189,7 @@ def analyse_gold():
             confirmation["close"] > recent["high"].max()
         )
         stop = float(sweep["low"])
+
     else:
         confirmed = (
             confirmation["close"] < recent["low"].min()
@@ -149,23 +211,29 @@ def analyse_gold():
         else entry - 2 * risk
     )
 
-    # Uganda local time. Session boundaries are approximate
-    # because London and New York observe daylight saving time.
+    # Uganda local time.
     local_time = datetime.now(TZ)
     hour = local_time.hour
 
     sessions = []
+
     if 10 <= hour < 20:
         sessions.append("London")
+
     if hour >= 15 or hour < 1:
         sessions.append("New York")
 
     if not sessions:
         return None
 
-    # Only alert shortly after a new M15 candle closes.
-    candle_close = confirmation.name + pd.Timedelta(minutes=15)
-    age_minutes = (now - candle_close).total_seconds() / 60
+    # Alert only shortly after a completed M15 candle.
+    candle_close = (
+        confirmation.name + pd.Timedelta(minutes=15)
+    )
+
+    age_minutes = (
+        now - candle_close
+    ).total_seconds() / 60
 
     if age_minutes < 0 or age_minutes > 5:
         return None
@@ -177,8 +245,11 @@ def analyse_gold():
         "entry": entry,
         "stop": stop,
         "target": target,
+        "source": source,
         "candle_time": str(confirmation.name),
-        "local_time": local_time.strftime("%Y-%m-%d %H:%M EAT")
+        "local_time": local_time.strftime(
+            "%Y-%m-%d %H:%M EAT"
+        )
     }
 
 
@@ -205,15 +276,19 @@ def main():
         f"Entry reference: {signal['entry']:.2f}\n"
         f"Invalidation: {signal['stop']:.2f}\n"
         f"2R target reference: {signal['target']:.2f}\n\n"
+        f"Data source: {signal['source']}\n\n"
         f"Reason: {signal['reason']}\n"
         f"M15 candle: {signal['candle_time']}\n"
         f"Uganda time: {signal['local_time']}\n\n"
-        "Confirm the setup, broker price and spread manually. "
-        "These are analysis references, not guaranteed prices. "
-        "No automatic orders are placed."
+        "IMPORTANT: If the source is GC=F, these are "
+        "COMEX futures prices, not Exness XAUUSD spot prices. "
+        "Check your broker price and spread before considering "
+        "any trade. These are analysis references, not guaranteed "
+        "prices. No automatic orders are placed."
     )
 
     send_telegram(message)
+
     logging.info("Telegram alert sent successfully.")
 
 
